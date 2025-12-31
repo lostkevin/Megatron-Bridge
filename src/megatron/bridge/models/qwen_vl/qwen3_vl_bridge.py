@@ -17,9 +17,10 @@ from typing import Dict, Union
 import torch
 import torch.nn as nn
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLMoeForConditionalGeneration
+from megatron.core import mpu
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
-from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, WeightConversionTask
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     GatedMLPMapping,
@@ -215,6 +216,13 @@ class Qwen3VLMoEBridge(MegatronModelBridge):
         >>> bridge = AutoBridge.from_hf_pretrained("Qwen/Qwen3-VL-30B-A3B-Instruct")
         >>> provider = bridge.to_megatron_provider()
     """
+    def __init__(self):
+        super().__init__()
+        # Qwen3-VL HF weights has one weight for all the experts, but megatron has one for each expert
+        # We need to cache the weights during import to load and dequantize the expert weights only once.
+        # and we need to merge the weights of multiple experts during export.
+        self.hf_weights_cache = {}
+
 
     def provider_bridge(self, hf_pretrained: PreTrainedVLM) -> Qwen3VLMoEModelProvider:
         """
@@ -360,6 +368,46 @@ class Qwen3VLMoEBridge(MegatronModelBridge):
         return MegatronMappingRegistry(*mapping_list)
 
 
+    def maybe_modify_converted_hf_weight(
+        self, task: WeightConversionTask, converted_weights_dict: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        num_experts = self.hf_config.text_config.num_experts
+        ep_size = mpu.get_expert_model_parallel_world_size()
+        experts_per_rank = num_experts // ep_size
+
+        try:
+            local_expert_number = extract_expert_number_from_param(task.param_name) % experts_per_rank
+        except ValueError:
+            # not an expert weight
+            return converted_weights_dict
+
+        assert len(converted_weights_dict) == 1, (
+            f"There should be only one key in the converted_weights_dict, got keys: {converted_weights_dict.keys()}"
+        )
+        for key, value in converted_weights_dict.items():
+            if key not in self.hf_weights_cache:
+                self.hf_weights_cache[key] = {}
+
+            # we end up with ep_size many weights to add to the cache
+            # unpack the weights and re-index
+            if ep_size == 1:
+                self.hf_weights_cache[key][local_expert_number] = value
+            else:
+                assert value.shape[0] == ep_size
+                for i, exp_val in enumerate(value):
+                    global_expert_number = local_expert_number + (i * experts_per_rank)
+                    self.hf_weights_cache[key][global_expert_number] = exp_val
+            if len(self.hf_weights_cache[key]) == num_experts:
+                # all experts are loaded
+                merged_hf_weights = torch.cat(
+                    [self.hf_weights_cache[key][i].unsqueeze(0) for i in range(num_experts)], dim=0
+                )
+                del self.hf_weights_cache[key]
+                return {key: merged_hf_weights}
+            else:
+                # not all experts are loaded yet, return empty dict
+                return {}
+
 class ExpertMLPDownProjMapping(AutoMapping):
     """Mapping for expert MLP down projection weights between HF and Megatron formats."""
 
@@ -368,10 +416,10 @@ class ExpertMLPDownProjMapping(AutoMapping):
         return super().hf_to_megatron(hf_weights[global_expert_number].transpose(0, 1), megatron_module)
 
     def megatron_to_hf(self, megatron_weights: torch.Tensor, megatron_module: nn.Module) -> Dict[str, torch.Tensor]:
-        if megatron_weights is None:
-            return super().megatron_to_hf(megatron_weights, megatron_module)
-
-        return super().megatron_to_hf(megatron_weights.transpose(0, 1).contiguous(), megatron_module)
+        converted_weights_dict = super().megatron_to_hf(megatron_weights, megatron_module)
+        for k, v in converted_weights_dict.items():
+            converted_weights_dict[k] = v.transpose(0, 1).contiguous()
+        return converted_weights_dict
 
     def _validate_patterns(self, *args, **kwargs):
         # allow number of wildcards to mismatch in this mapping
@@ -386,11 +434,10 @@ class ExpertMLPGateUpProjMapping(AutoMapping):
         return super().hf_to_megatron(hf_weights[global_expert_number].transpose(0, 1), megatron_module)
 
     def megatron_to_hf(self, megatron_weights: torch.Tensor, megatron_module: nn.Module) -> Dict[str, torch.Tensor]:
-        if megatron_weights is None:
-            return super().megatron_to_hf(megatron_weights, megatron_module)
-
-        print(f"ExpertMLPGateUpProjMapping module {megatron_module} weights shape {megatron_weights.shape}")
-        return super().megatron_to_hf(megatron_weights.transpose(0, 1).contiguous(), megatron_module)
+        converted_weights_dict = super().megatron_to_hf(megatron_weights, megatron_module)
+        for k, v in converted_weights_dict.items():
+            converted_weights_dict[k] = v.transpose(0, 1).contiguous()
+        return converted_weights_dict
 
     def _validate_patterns(self, *args, **kwargs):
         # allow number of wildcards to mismatch in this mapping

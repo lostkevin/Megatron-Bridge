@@ -230,12 +230,17 @@ class GPTOSSMLPDownProjMapping(AutoMapping):
     def megatron_to_hf(self, megatron_weights: torch.Tensor, megatron_module: nn.Module) -> Dict[str, torch.Tensor]:
         # only bf16 export is supported currently
         if megatron_weights is None:
-            return super().megatron_to_hf(megatron_weights, megatron_module)
+            converted_weights_dict = super().megatron_to_hf(megatron_weights, megatron_module)
+        else:
+            megatron_weights = self._uninterleave(megatron_weights)
+            if len(megatron_weights.shape) == 2:
+                megatron_weights = megatron_weights.transpose(0, 1)
+            converted_weights_dict = super().megatron_to_hf(megatron_weights.contiguous(), megatron_module)
 
-        # GPT-OSS stores fc2 weight transposed vs Megatron when using BF16.
-        if len(megatron_weights.shape) == 2:
-            megatron_weights = megatron_weights.transpose(0, 1)
-        return super().megatron_to_hf(megatron_weights.contiguous(), megatron_module)
+        for k, v in converted_weights_dict.items():
+            if megatron_weights is not None and megatron_weights.ndim == 2:
+                converted_weights_dict[k] = v.transpose(0, 1).contiguous()
+        return converted_weights_dict
 
     def _validate_patterns(self, *args, **kwargs):
         # allow number of wildcards to mismatch in this mapping
@@ -269,12 +274,17 @@ class GPTOSSMLPGateUpProjMapping(AutoMapping):
     def megatron_to_hf(self, megatron_weights: torch.Tensor, megatron_module: nn.Module) -> Dict[str, torch.Tensor]:
         # only bf16 export is supported currently
         if megatron_weights is None:
-            return super().megatron_to_hf(megatron_weights, megatron_module)
+            converted_weights_dict = super().megatron_to_hf(megatron_weights, megatron_module)
+        else:
+            megatron_weights = self._uninterleave(megatron_weights)
+            if len(megatron_weights.shape) == 2:
+                megatron_weights = megatron_weights.transpose(0, 1)
+            converted_weights_dict = super().megatron_to_hf(megatron_weights.contiguous(), megatron_module)
 
-        megatron_weights = self._uninterleave(megatron_weights)
-        if len(megatron_weights.shape) == 2:
-            megatron_weights = megatron_weights.transpose(0, 1)
-        return super().megatron_to_hf(megatron_weights.contiguous(), megatron_module)
+        for k, v in converted_weights_dict.items():
+            if megatron_weights is not None and megatron_weights.ndim == 2:
+                converted_weights_dict[k] = v.transpose(0, 1).contiguous()
+        return converted_weights_dict
 
     def _validate_patterns(self, *args, **kwargs):
         # allow number of wildcards to mismatch in this mapping
